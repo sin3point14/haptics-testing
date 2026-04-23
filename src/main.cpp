@@ -1,24 +1,68 @@
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <string>
 
+#ifdef HAVE_OPENHAPTICS
 #include <HD/hd.h>
 #include <HDU/hduError.h>
+#endif
+
+#ifdef HAVE_HAPTION
+#include "haption_device.h"
+#endif
 
 #include <GL/glut.h>
 
-HHD g_hDevice = HD_INVALID_HANDLE;
+// ===================================================================
+// Backend selection
+// ===================================================================
+enum class DeviceBackend {
+    None,
+#ifdef HAVE_OPENHAPTICS
+    OpenHaptics,
+#endif
+#ifdef HAVE_HAPTION
+    Haption,
+#endif
+};
 
-HDdouble g_deviceTransform[16] = {
+#if defined(HAVE_OPENHAPTICS)
+static DeviceBackend g_backend = DeviceBackend::OpenHaptics;
+#elif defined(HAVE_HAPTION)
+static DeviceBackend g_backend = DeviceBackend::Haption;
+#else
+static DeviceBackend g_backend = DeviceBackend::None;
+#endif
+
+// ===================================================================
+// Haption connection string (default from SvcHaptic conf)
+// ===================================================================
+#ifdef HAVE_HAPTION
+static std::string g_haptionAddr = "127.0.0.1#5000";
+#endif
+
+// ===================================================================
+// OpenHaptics state
+// ===================================================================
+#ifdef HAVE_OPENHAPTICS
+static HHD g_hDevice = HD_INVALID_HANDLE;
+#endif
+
+// ===================================================================
+// Shared device state (both backends write into these)
+// ===================================================================
+static double g_deviceTransform[16] = {
     1.0, 0.0, 0.0, 0.0,
     0.0, 1.0, 0.0, 0.0,
     0.0, 0.0, 1.0, 0.0,
     0.0, 0.0, 0.0, 1.0
 };
-HDdouble g_position[3] = {0.0, 0.0, 0.0};
+static double g_position[3] = {0.0, 0.0, 0.0};
 
-const float g_blueOffsetLocal[3] = {+26.75698006, -11.32325751, +130.50953227};
+const float g_blueOffsetLocal[3] = {+26.75698006f, -11.32325751f, +130.50953227f};
 
 int g_windowWidth = 1024;
 int g_windowHeight = 768;
@@ -26,9 +70,12 @@ int g_windowHeight = 768;
 const float g_groundY = -120.0f;
 const float g_lightDir[3] = {-0.00f, -1.0f, -0.00f};
 
+// ===================================================================
+// Capture / logging (unchanged)
+// ===================================================================
 struct PoseSample {
-    HDdouble transform[16];
-    HDdouble position[3];
+    double transform[16];
+    double position[3];
     bool ok;
 };
 
@@ -51,6 +98,9 @@ void logPose() {
               << g_deviceTransform[2] << ',' << g_deviceTransform[6] << ',' << g_deviceTransform[10] << '\n';
 }
 
+// ===================================================================
+// Drawing helpers (unchanged)
+// ===================================================================
 void drawBox(float size) {
     glutSolidCube(size);
 }
@@ -102,7 +152,7 @@ void drawBoxPair() {
     glPopMatrix();
 }
 
-void transformPoint(const HDdouble m[16], const float p[3], float out[3]) {
+void transformPoint(const double m[16], const float p[3], float out[3]) {
     out[0] = static_cast<float>(m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12]);
     out[1] = static_cast<float>(m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13]);
     out[2] = static_cast<float>(m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14]);
@@ -147,6 +197,10 @@ void drawProjectedShadows() {
     glDisable(GL_BLEND);
 }
 
+// ===================================================================
+// OpenHaptics device read
+// ===================================================================
+#ifdef HAVE_OPENHAPTICS
 HDCallbackCode HDCALLBACK copyPoseCallback(void* userData) {
     PoseSample* sample = static_cast<PoseSample*>(userData);
     if (sample == nullptr || g_hDevice == HD_INVALID_HANDLE) {
@@ -155,46 +209,61 @@ HDCallbackCode HDCALLBACK copyPoseCallback(void* userData) {
 
     sample->ok = false;
     hdBeginFrame(g_hDevice);
-    hdGetDoublev(HD_CURRENT_POSITION, sample->position);
-    hdGetDoublev(HD_CURRENT_TRANSFORM, sample->transform);
+    HDdouble pos[3], xform[16];
+    hdGetDoublev(HD_CURRENT_POSITION, pos);
+    hdGetDoublev(HD_CURRENT_TRANSFORM, xform);
     hdEndFrame(g_hDevice);
 
     const HDErrorInfo err = hdGetError();
     if (!HD_DEVICE_ERROR(err)) {
+        for (int i = 0; i < 16; ++i) sample->transform[i] = xform[i];
+        for (int i = 0; i < 3; ++i)  sample->position[i]  = pos[i];
         sample->ok = true;
     }
     return HD_CALLBACK_DONE;
 }
+#endif
 
+// ===================================================================
+// Backend-agnostic device read
+// ===================================================================
 void readDeviceState() {
-    if (g_hDevice == HD_INVALID_HANDLE) {
-        return;
-    }
+    switch (g_backend) {
+#ifdef HAVE_OPENHAPTICS
+    case DeviceBackend::OpenHaptics: {
+        if (g_hDevice == HD_INVALID_HANDLE) return;
 
-    PoseSample sample = {
-        {
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0
-        },
-        {0.0, 0.0, 0.0},
-        false
-    };
+        PoseSample sample = {
+            { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 },
+            {0, 0, 0},
+            false
+        };
+        hdScheduleSynchronous(copyPoseCallback, &sample, HD_DEFAULT_SCHEDULER_PRIORITY);
+        if (!sample.ok) return;
 
-    hdScheduleSynchronous(copyPoseCallback, &sample, HD_DEFAULT_SCHEDULER_PRIORITY);
-    if (!sample.ok) {
-        return;
+        for (int i = 0; i < 16; ++i) g_deviceTransform[i] = sample.transform[i];
+        for (int i = 0; i < 3; ++i)  g_position[i] = sample.position[i];
+        break;
     }
-
-    for (int i = 0; i < 16; ++i) {
-        g_deviceTransform[i] = sample.transform[i];
+#endif
+#ifdef HAVE_HAPTION
+    case DeviceBackend::Haption: {
+        double xform[16], pos[3];
+        if (haption_read_state(xform, pos)) {
+            for (int i = 0; i < 16; ++i) g_deviceTransform[i] = xform[i];
+            for (int i = 0; i < 3; ++i)  g_position[i] = pos[i];
+        }
+        break;
     }
-    for (int i = 0; i < 3; ++i) {
-        g_position[i] = sample.position[i];
+#endif
+    default:
+        break;
     }
 }
 
+// ===================================================================
+// Display / reshape / input (unchanged logic)
+// ===================================================================
 void setupCamera() {
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
@@ -256,32 +325,68 @@ void keyboard(unsigned char key, int, int) {
     }
 }
 
+// ===================================================================
+// Backend-agnostic init / shutdown
+// ===================================================================
 void shutdownDevice() {
-    if (g_hDevice != HD_INVALID_HANDLE) {
-        hdDisableDevice(g_hDevice);
-        g_hDevice = HD_INVALID_HANDLE;
+    switch (g_backend) {
+#ifdef HAVE_OPENHAPTICS
+    case DeviceBackend::OpenHaptics:
+        if (g_hDevice != HD_INVALID_HANDLE) {
+            hdDisableDevice(g_hDevice);
+            g_hDevice = HD_INVALID_HANDLE;
+        }
+        break;
+#endif
+#ifdef HAVE_HAPTION
+    case DeviceBackend::Haption:
+        haption_shutdown();
+        break;
+#endif
+    default:
+        break;
     }
 }
 
 void initDevice() {
-    HDErrorInfo error;
-    g_hDevice = hdInitDevice(HD_DEFAULT_DEVICE);
-    if (HD_DEVICE_ERROR(error = hdGetError())) {
-        std::cerr << "Failed to initialize OpenHaptics device: "
-                  << hdGetErrorString(error.errorCode) << std::endl;
+    switch (g_backend) {
+#ifdef HAVE_OPENHAPTICS
+    case DeviceBackend::OpenHaptics: {
+        std::cerr << "Initialising OpenHaptics device..." << std::endl;
+        HDErrorInfo error;
+        g_hDevice = hdInitDevice(HD_DEFAULT_DEVICE);
+        if (HD_DEVICE_ERROR(error = hdGetError())) {
+            std::cerr << "Failed to initialize OpenHaptics device: "
+                      << hdGetErrorString(error.errorCode) << std::endl;
+            std::exit(EXIT_FAILURE);
+        }
+        hdEnable(HD_FORCE_OUTPUT);
+        hdStartScheduler();
+        if (HD_DEVICE_ERROR(error = hdGetError())) {
+            std::cerr << "Failed to start haptics scheduler: "
+                      << hdGetErrorString(error.errorCode) << std::endl;
+            shutdownDevice();
+            std::exit(EXIT_FAILURE);
+        }
+        hdMakeCurrentDevice(g_hDevice);
+        std::cerr << "OpenHaptics device ready." << std::endl;
+        break;
+    }
+#endif
+#ifdef HAVE_HAPTION
+    case DeviceBackend::Haption: {
+        if (!haption_init(g_haptionAddr.c_str())) {
+            std::cerr << "Failed to initialise Haption device at "
+                      << g_haptionAddr << std::endl;
+            std::exit(EXIT_FAILURE);
+        }
+        break;
+    }
+#endif
+    default:
+        std::cerr << "No device backend available!" << std::endl;
         std::exit(EXIT_FAILURE);
     }
-
-    hdEnable(HD_FORCE_OUTPUT);
-    hdStartScheduler();
-    if (HD_DEVICE_ERROR(error = hdGetError())) {
-        std::cerr << "Failed to start haptics scheduler: "
-                  << hdGetErrorString(error.errorCode) << std::endl;
-        shutdownDevice();
-        std::exit(EXIT_FAILURE);
-    }
-
-    hdMakeCurrentDevice(g_hDevice);
 }
 
 void initGraphics() {
@@ -292,13 +397,62 @@ void initGraphics() {
     glShadeModel(GL_SMOOTH);
 }
 
+// ===================================================================
+// Usage / argument parsing
+// ===================================================================
+void printUsage(const char* progName) {
+    std::cerr << "Usage: " << progName << " [OPTIONS]\n"
+              << "\n"
+              << "Options:\n"
+#ifdef HAVE_OPENHAPTICS
+              << "  --openhaptics        Use OpenHaptics (3DS Touch) backend [default]\n"
+#endif
+#ifdef HAVE_HAPTION
+              << "  --haption [ip#port]  Use Haption (Virtuose) backend\n"
+              << "                       Default address: 127.0.0.1#5000\n"
+#endif
+              << "  --help               Show this help\n";
+}
+
+void parseArgs(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+
+#ifdef HAVE_OPENHAPTICS
+        if (arg == "--openhaptics") {
+            g_backend = DeviceBackend::OpenHaptics;
+            continue;
+        }
+#endif
+#ifdef HAVE_HAPTION
+        if (arg == "--haption") {
+            g_backend = DeviceBackend::Haption;
+            // Optional next arg is ip:port
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                g_haptionAddr = argv[++i];
+            }
+            continue;
+        }
+#endif
+        if (arg == "--help" || arg == "-h") {
+            printUsage(argv[0]);
+            std::exit(0);
+        }
+    }
+}
+
+// ===================================================================
+// main
+// ===================================================================
 int main(int argc, char** argv) {
+    parseArgs(argc, argv);
+
     initDevice();
 
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH);
     glutInitWindowSize(g_windowWidth, g_windowHeight);
-    glutCreateWindow("Hello");
+    glutCreateWindow("Haptics Test");
 
     initGraphics();
 
