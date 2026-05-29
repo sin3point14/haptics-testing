@@ -62,7 +62,7 @@ static double g_deviceTransform[16] = {
 };
 static double g_position[3] = {0.0, 0.0, 0.0};
 
-const float g_blueOffsetLocal[3] = {+26.75698006f, -11.32325751f, +130.50953227f};
+const float g_blueOffsetLocal[3] = {96.893693035, 8.819358212, 138.764763464};
 
 int g_windowWidth = 1024;
 int g_windowHeight = 768;

@@ -159,6 +159,7 @@ def solve_local_vector(samples: list[dict]) -> tuple[np.ndarray, float, float, f
     # global offset. For each sample:
     #   t_i = R_i u + o + s * p_i
     # which is linear in the unknowns.
+    # u = s * d is a single unknown vector that captures the local vector scaled by the unknown scale factor, which allows us to keep the system linear. After solving for u, we can recover d by dividing by the estimated scale. The design matrix has 7 columns corresponding to the 7 unknowns in x, and each sample contributes 3 rows (one per dimension), resulting in a total of 3N rows.
     design_rows = []
     targets = []
     p_rows = []
