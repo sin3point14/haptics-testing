@@ -231,7 +231,7 @@ def load_library(base_dir: str) -> ctypes.CDLL:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", default="openhaptics", choices=["openhaptics", "geomagic", "haption"], help="Haptics backend")
-    parser.add_argument("--device", default="", help="Device name for OpenHaptics or connection string for Haption")
+    parser.add_argument("--device", default=None, help="Device name for OpenHaptics or connection string for Haption")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -260,7 +260,7 @@ def main() -> int:
     lib.haptics_last_error.restype = ctypes.c_char_p
 
     backend = args.backend.encode("utf-8")
-    device = args.device.encode("utf-8")
+    device = args.device.encode("utf-8") if args.device is not None else None
     if lib.haptics_open(backend, device) == 0:
         err = lib.haptics_last_error()
         raise RuntimeError(err.decode("utf-8") if err else "failed to open haptics backend")
