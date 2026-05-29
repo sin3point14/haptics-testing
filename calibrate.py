@@ -120,6 +120,7 @@ def plot_point_comparison(target_points: list[np.ndarray], predicted_points: lis
 
     ax.scatter(target[:, 0], target[:, 1], target[:, 2], c="tab:blue", marker="o", s=55, label="Interpolated targets")
     ax.scatter(predicted[:, 0], predicted[:, 1], predicted[:, 2], c="tab:orange", marker="^", s=55, label="s*(R*d + p)")
+    ax.scatter(predicted[:, 0], predicted[:, 1], predicted[:, 2], c="tab:orange", marker="^", s=55, label="s*(R*d + p) + o")
 
     for i in range(len(target_points)):
         ax.plot(
@@ -150,10 +151,14 @@ def plot_point_comparison(target_points: list[np.ndarray], predicted_points: lis
     plt.show()
 
 
-def solve_local_vector(samples: list[dict]) -> tuple[np.ndarray, float, float, float, np.ndarray]:
+def solve_local_vector(samples: list[dict]) -> tuple[np.ndarray, float, float, float, float, np.ndarray]:
     if len(samples) < RECORD_COUNT:
         raise ValueError(f"Need {RECORD_COUNT} samples, got {len(samples)}")
 
+    # We solve for x = [u(3), o(3), s(1)] where u = s * d and o is the
+    # global offset. For each sample:
+    #   t_i = R_i u + o + s * p_i
+    # which is linear in the unknowns.
     design_rows = []
     targets = []
     p_rows = []
@@ -162,25 +167,30 @@ def solve_local_vector(samples: list[dict]) -> tuple[np.ndarray, float, float, f
         p = np.asarray(sample["position"], dtype=float)
         r = np.asarray(sample["rotation"], dtype=float)
         target = target_point_for_query(i)
-        design_rows.append(np.column_stack([r, p]))
+        # A_i = [R_i | I_3 | p_i]
+        a_block = np.hstack([r, np.eye(3), p.reshape(3, 1)])
+        design_rows.append(a_block)
         targets.append(target)
         p_rows.append(p)
 
     a_mat = np.vstack(design_rows)
     b_vec = np.concatenate(targets)
-    # initial residual assuming d = 0 and s = 1
+    # initial residual assuming d = 0, s = 1, o = 0 (i.e. predict p)
     initial_residual = float(np.linalg.norm(b_vec - np.concatenate(p_rows)))
+
     x, residuals, rank, singular_values = np.linalg.lstsq(a_mat, b_vec, rcond=None)
     residual = float(np.linalg.norm(a_mat @ x - b_vec))
-    u = x[:3]
-    scale = float(x[3])
+
+    u = x[0:3]
+    o = x[3:6]
+    scale = float(x[6])
     if abs(scale) < 1e-12:
         raise ValueError("Estimated scale is too close to zero")
     d = u / scale
-    return d, scale, initial_residual, residual, singular_values
+    return d, scale, o, initial_residual, residual, singular_values
 
 
-def solve_local_vector_with_axis_permutation(samples: list[dict]) -> tuple[np.ndarray, float, float, float, np.ndarray, tuple[int, int, int], tuple[int, int, int]]:
+def solve_local_vector_with_axis_permutation(samples: list[dict]) -> tuple[np.ndarray, float, np.ndarray, float, float, np.ndarray, tuple[int, int, int], tuple[int, int, int]]:
     best_result = None
     best_perm = None
     best_signs = None
@@ -191,7 +201,8 @@ def solve_local_vector_with_axis_permutation(samples: list[dict]) -> tuple[np.nd
             transform = build_axis_transform(perm, signs)
             transformed_samples = [transform_pose_sample(sample, transform) for sample in samples]
             result = solve_local_vector(transformed_samples)
-            residual = result[3]
+            # result = (d, scale, o, initial_residual, residual, singular_values)
+            residual = result[4]
             if best_result is None or residual < best_residual:
                 best_result = result
                 best_perm = perm
@@ -334,16 +345,17 @@ def main() -> int:
             existing = load_recording(out_path)
             if len(existing) >= RECORD_COUNT:
                 existing = existing[:RECORD_COUNT]
-                d, scale, initial_residual, residual, singular_values, perm, signs = solve_local_vector_with_axis_permutation(existing)
+                d, scale, o, initial_residual, residual, singular_values, perm, signs = solve_local_vector_with_axis_permutation(existing)
                 target_points = [target_point_for_query(i) for i in range(RECORD_COUNT)]
                 predicted_points = []
                 transform = build_axis_transform(perm, signs)
                 for sample in [transform_pose_sample(sample, transform) for sample in existing]:
                     p = np.asarray(sample["position"], dtype=float)
                     r = np.asarray(sample["rotation"], dtype=float)
-                    predicted_points.append(scale * (r @ d + p))
+                    predicted_points.append(scale * (r @ d + p) + o)
                 print(f"d = {d[0]:.9f}, {d[1]:.9f}, {d[2]:.9f}")
                 print(f"scale = {scale:.9f}")
+                print(f"offset = {o[0]:.9f}, {o[1]:.9f}, {o[2]:.9f}")
                 print(f"axis_transform = {format_axis_transform(perm, signs)}")
                 print(f"initial_residual = {initial_residual:.9f}")
                 print(f"residual_norm = {residual:.9f}")
@@ -372,17 +384,18 @@ def main() -> int:
                 save_recording(out_path, existing)
                 print(f"Recorded step {step}/{RECORD_COUNT} and saved to {out_path}")
 
-            d, scale, initial_residual, residual, singular_values, perm, signs = solve_local_vector_with_axis_permutation(existing[:RECORD_COUNT])
+            d, scale, o, initial_residual, residual, singular_values, perm, signs = solve_local_vector_with_axis_permutation(existing[:RECORD_COUNT])
             target_points = [target_point_for_query(i) for i in range(RECORD_COUNT)]
             predicted_points = []
             transform = build_axis_transform(perm, signs)
             for sample in [transform_pose_sample(sample, transform) for sample in existing[:RECORD_COUNT]]:
                 p = np.asarray(sample["position"], dtype=float)
                 r = np.asarray(sample["rotation"], dtype=float)
-                predicted_points.append(scale * (r @ d + p))
+                predicted_points.append(scale * (r @ d + p) + o)
             print("Recording complete.")
             print(f"d = {d[0]:.9f}, {d[1]:.9f}, {d[2]:.9f}")
             print(f"scale = {scale:.9f}")
+            print(f"offset = {o[0]:.9f}, {o[1]:.9f}, {o[2]:.9f}")
             print(f"axis_transform = {format_axis_transform(perm, signs)}")
             print(f"initial_residual = {initial_residual:.9f}")
             print(f"residual_norm = {residual:.9f}")
