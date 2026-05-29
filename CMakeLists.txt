@@ -1,4 +1,45 @@
 cmake_minimum_required(VERSION 3.20)
+
+if(WIN32)
+  file(GLOB _MSVC_LIB_DIRS
+    "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/*/lib/x64")
+  list(SORT _MSVC_LIB_DIRS COMPARE NATURAL ORDER DESCENDING)
+  list(GET _MSVC_LIB_DIRS 0 _MSVC_LIB_DIR)
+  get_filename_component(_MSVC_LIB_PARENT "${_MSVC_LIB_DIR}" DIRECTORY)
+  get_filename_component(_MSVC_TOOLSET_DIR "${_MSVC_LIB_PARENT}" DIRECTORY)
+
+  set(_WINDOWS_SDK_ROOT "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0")
+  set(_WINDOWS_SDK_UM_LIB "${_WINDOWS_SDK_ROOT}/um/x64")
+  set(_WINDOWS_SDK_UCRT_LIB "${_WINDOWS_SDK_ROOT}/ucrt/x64")
+
+  set(ENV{VSINSTALLDIR} "C:/Program Files/Microsoft Visual Studio/2022/Community/")
+  set(ENV{VCToolsInstallDir} "${_MSVC_TOOLSET_DIR}/")
+  set(ENV{WindowsSdkDir} "C:/Program Files (x86)/Windows Kits/10/")
+  set(ENV{WindowsSDKVersion} "10.0.26100.0/")
+  set(ENV{LIB}
+    "${_MSVC_LIB_DIR};${_WINDOWS_SDK_UM_LIB};${_WINDOWS_SDK_UCRT_LIB};$ENV{LIB}")
+
+  find_program(_WINDOWS_RC_EXE
+    NAMES rc.exe
+    PATHS
+      "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64"
+      "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x86"
+    NO_DEFAULT_PATH)
+  if(_WINDOWS_RC_EXE)
+    set(CMAKE_RC_COMPILER "${_WINDOWS_RC_EXE}" CACHE FILEPATH "Windows resource compiler" FORCE)
+  endif()
+
+  find_program(_WINDOWS_MT_EXE
+    NAMES mt.exe
+    PATHS
+      "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64"
+      "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x86"
+    NO_DEFAULT_PATH)
+  if(_WINDOWS_MT_EXE)
+    set(CMAKE_MT "${_WINDOWS_MT_EXE}" CACHE FILEPATH "Windows manifest tool" FORCE)
+  endif()
+endif()
+
 project(test_haptics LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -11,6 +52,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(ENABLE_OPENHAPTICS "Build with OpenHaptics (3DS Touch) support" ON)
 option(ENABLE_HAPTION     "Build with Haption (Virtuose) support"      ON)
 
+if(WIN32 AND ENABLE_HAPTION)
+  message(STATUS "Haption support is disabled on Windows for this build.")
+  set(ENABLE_HAPTION OFF CACHE BOOL "Build with Haption (Virtuose) support" FORCE)
+endif()
+
 set(VIRTUOSE_API_ROOT "/home/rupeshcsz228228/my_projs/sofa/Haption_data/VirtuoseAPI_v4_04"
     CACHE PATH "Root of the VirtuoseAPI SDK")
 
@@ -19,6 +65,7 @@ set(ALL_INCLUDE_DIRS "")
 set(ALL_LINK_LIBS "")
 set(ALL_COMPILE_DEFS "")
 set(ALL_SOURCES src/main.cpp)
+set(POSE_LIB_SOURCES src/haptics_pose.cpp)
 
 # ============================================================================
 # OpenHaptics backend
@@ -146,6 +193,7 @@ if(ENABLE_OPENHAPTICS)
   endif()
 
   list(APPEND ALL_COMPILE_DEFS HAVE_OPENHAPTICS)
+  list(APPEND POSE_LIB_SOURCES)
   message(STATUS "OpenHaptics support: ENABLED")
 endif()
 
@@ -153,6 +201,10 @@ endif()
 # Haption (Virtuose) backend
 # ============================================================================
 if(ENABLE_HAPTION)
+  if(WIN32)
+    message(FATAL_ERROR "ENABLE_HAPTION is only supported on UNIX builds in this repository.")
+  endif()
+
   # --- header ---
   find_path(VIRTUOSE_INCLUDE_DIR
     NAMES virtuoseAPI.h
@@ -206,6 +258,7 @@ if(ENABLE_HAPTION)
   list(APPEND ALL_LINK_LIBS "${VIRTUOSE_LIBRARY}" Threads::Threads ${CMAKE_DL_LIBS} rt)
   list(APPEND ALL_COMPILE_DEFS HAVE_HAPTION)
   list(APPEND ALL_SOURCES src/haption_device.cpp)
+  list(APPEND POSE_LIB_SOURCES src/haption_device.cpp)
 
   # Copy virtuoseAPI.so next to the binary so dlopen finds it
   set(VIRTUOSE_COPY_SO TRUE)
@@ -234,6 +287,19 @@ endif()
 # ============================================================================
 # Target
 # ============================================================================
+add_library(haptics_pose SHARED ${POSE_LIB_SOURCES})
+
+target_include_directories(haptics_pose PRIVATE ${ALL_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+if(ALL_COMPILE_DEFS)
+  target_compile_definitions(haptics_pose PRIVATE ${ALL_COMPILE_DEFS})
+endif()
+
+target_link_libraries(haptics_pose PRIVATE ${ALL_LINK_LIBS})
+
+set_target_properties(haptics_pose PROPERTIES
+  OUTPUT_NAME "haptics_pose")
+
 add_executable(test_haptics ${ALL_SOURCES})
 
 target_include_directories(test_haptics PRIVATE ${ALL_INCLUDE_DIRS})
