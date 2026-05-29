@@ -215,35 +215,6 @@ def solve_local_vector_with_axis_permutation(samples: list[dict]) -> tuple[np.nd
     return (*best_result, best_perm, best_signs)
 
 
-def solve_local_vector_from_plane(samples: list[dict]) -> tuple[np.ndarray, float, float, float, np.ndarray]:
-    if not samples:
-        raise ValueError("Need at least one sample")
-
-    design_rows = []
-    p_ys = []
-    for sample in samples:
-        p = np.asarray(sample["position"], dtype=float)
-        r = np.asarray(sample["rotation"], dtype=float)
-        design_rows.append([r[1, 0], r[1, 1], r[1, 2]])
-        p_ys.append(p[1])
-
-    a_mat = np.asarray(design_rows, dtype=float)
-    p_y_vec = np.asarray(p_ys, dtype=float)
-
-    # Solve for d by forcing the y-values of R*d + p to be as equal as possible.
-    # This is equivalent to fitting the centered system:
-    #   (A - mean(A)) d = -(p_y - mean(p_y))
-    a_centered = a_mat - np.mean(a_mat, axis=0, keepdims=True)
-    p_centered = p_y_vec - float(np.mean(p_y_vec))
-    initial_residual = float(np.linalg.norm(p_centered))
-
-    d, residuals, rank, singular_values = np.linalg.lstsq(a_centered, -p_centered, rcond=None)
-    residual = float(np.linalg.norm(a_centered @ d + p_centered))
-    y_values = a_mat @ d + p_y_vec
-    plane_y = float(np.mean(y_values))
-    return d, plane_y, initial_residual, residual, singular_values
-
-
 def load_library(base_dir: str) -> ctypes.CDLL:
     dll_name = "haptics_pose.dll" if os.name == "nt" else "libhaptics_pose.so"
     candidates = [
@@ -259,15 +230,20 @@ def load_library(base_dir: str) -> ctypes.CDLL:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", default="openhaptics", choices=["openhaptics", "geomagic", "haption"])
+    parser.add_argument("--backend", default="openhaptics", choices=["openhaptics", "geomagic", "haption"], help="Haptics backend")
     parser.add_argument("--device", default="", help="Device name for OpenHaptics or connection string for Haption")
-    parser.add_argument("--interval", type=float, default=0.02, help="Seconds between queries")
-    parser.add_argument("--samples", type=int, default=0, help="Number of samples to print before exiting; 0 means run forever")
-    parser.add_argument("--output", default="recording.json", help="Output path for recording (JSON)")
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--debug", action="store_true", help="Print pose every frame")
-    mode.add_argument("--estimate-from-plane", action="store_true", help="Estimate d from samples constrained to a fixed y plane")
-    mode.add_argument("--estimate-from-points", action="store_true", help="Record 10 query points and estimate d from them")
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Debug subcommand: live streaming from device
+    sp_debug = subparsers.add_parser("debug", help="Print pose every frame")
+    sp_debug.add_argument("--interval", type=float, default=0.02, help="Seconds between queries")
+    sp_debug.add_argument("--samples", type=int, default=0, help="Number of samples to print before exiting; 0 means run forever")
+
+    # Calibrate subcommand: record N query points and solve
+    sp_cal = subparsers.add_parser("calibrate", help="Record query points and estimate calibration")
+    sp_cal.add_argument("--recording-file", default="recording.json", help="Output path for recording (JSON)")
+
     args = parser.parse_args()
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -292,13 +268,12 @@ def main() -> int:
     transform = (ctypes.c_double * 16)()
     position = (ctypes.c_double * 3)()
     try:
-        if args.debug:
+        if args.command == "debug":
             printed = 0
             while True:
                 if lib.haptics_get_pose(transform, position) == 0:
                     err = lib.haptics_last_error()
                     raise RuntimeError(err.decode("utf-8") if err else "failed to query pose")
-
                 print(f"{position[0]:.6f},{position[1]:.6f},{position[2]:.6f}")
                 print(f"{transform[0]:.6f},{transform[4]:.6f},{transform[8]:.6f}")
                 print(f"{transform[1]:.6f},{transform[5]:.6f},{transform[9]:.6f}")
@@ -311,88 +286,19 @@ def main() -> int:
 
             return 0
 
-        if args.estimate_from_plane:
-            print("Warning: plane mode does not estimate scale s; results assume the device and model units are already aligned.", file=sys.stderr)
-            input("Press Enter when ready to start the 1 second wait... ")
-            time.sleep(1.0)
-            samples = []
-            deadline = time.time() + 5.0
-            while time.time() < deadline:
-                if lib.haptics_get_pose(transform, position) == 0:
-                    err = lib.haptics_last_error()
-                    raise RuntimeError(err.decode("utf-8") if err else "failed to query pose")
-
-                samples.append({
-                    "position": [float(position[0]), float(position[1]), float(position[2])],
-                    "rotation": [
-                        [float(transform[0]), float(transform[4]), float(transform[8])],
-                        [float(transform[1]), float(transform[5]), float(transform[9])],
-                        [float(transform[2]), float(transform[6]), float(transform[10])],
-                    ],
-                })
-                time.sleep(args.interval)
-
-            d, plane_y, initial_residual, residual, singular_values = solve_local_vector_from_plane(samples)
-            print(f"d = {d[0]:.9f}, {d[1]:.9f}, {d[2]:.9f}")
-            print(f"plane_y = {plane_y:.9f}")
-            print(f"initial_residual = {initial_residual:.9f}")
-            print(f"residual_norm = {residual:.9f}")
-            print("singular_values = " + ", ".join(f"{value:.9f}" for value in singular_values))
-            return 0
-
-        if args.estimate_from_points:
-            out_path = os.path.join(base_dir, args.output)
-            existing = load_recording(out_path)
-            if len(existing) >= RECORD_COUNT:
-                existing = existing[:RECORD_COUNT]
-                d, scale, o, initial_residual, residual, singular_values, perm, signs = solve_local_vector_with_axis_permutation(existing)
-                target_points = [target_point_for_query(i) for i in range(RECORD_COUNT)]
-                predicted_points = []
-                transform = build_axis_transform(perm, signs)
-                for sample in [transform_pose_sample(sample, transform) for sample in existing]:
-                    p = np.asarray(sample["position"], dtype=float)
-                    r = np.asarray(sample["rotation"], dtype=float)
-                    predicted_points.append(scale * (r @ d + p) + o)
-                print(f"d = {d[0]:.9f}, {d[1]:.9f}, {d[2]:.9f}")
-                print(f"scale = {scale:.9f}")
-                print(f"offset = {o[0]:.9f}, {o[1]:.9f}, {o[2]:.9f}")
-                print(f"axis_transform = {format_axis_transform(perm, signs)}")
-                print(f"initial_residual = {initial_residual:.9f}")
-                print(f"residual_norm = {residual:.9f}")
-                print("singular_values = " + ", ".join(f"{value:.9f}" for value in singular_values))
-                print_point_error_report(target_points, predicted_points)
-                plot_point_comparison(target_points, predicted_points, title=f"Interpolated targets vs fitted device points {format_axis_transform(perm, signs)}")
-                return 0
-
-            start_step = len(existing) + 1
-            for step in range(start_step, RECORD_COUNT + 1):
-                input(f"Prepare for Step {step}. Press Enter when ready to start 5s countdown... ")
-                print("Waiting 5 seconds...")
-                time.sleep(5.0)
-                if lib.haptics_get_pose(transform, position) == 0:
-                    err = lib.haptics_last_error()
-                    raise RuntimeError(err.decode("utf-8") if err else "failed to query pose")
-
-                existing.append({
-                    "position": [float(position[0]), float(position[1]), float(position[2])],
-                    "rotation": [
-                        [float(transform[0]), float(transform[4]), float(transform[8])],
-                        [float(transform[1]), float(transform[5]), float(transform[9])],
-                        [float(transform[2]), float(transform[6]), float(transform[10])],
-                    ],
-                })
-                save_recording(out_path, existing)
-                print(f"Recorded step {step}/{RECORD_COUNT} and saved to {out_path}")
-
-            d, scale, o, initial_residual, residual, singular_values, perm, signs = solve_local_vector_with_axis_permutation(existing[:RECORD_COUNT])
+        # Calibrate subcommand: record/estimate from points
+        out_path = os.path.join(base_dir, args.recording_file)
+        existing = load_recording(out_path)
+        if len(existing) >= RECORD_COUNT:
+            existing = existing[:RECORD_COUNT]
+            d, scale, o, initial_residual, residual, singular_values, perm, signs = solve_local_vector_with_axis_permutation(existing)
             target_points = [target_point_for_query(i) for i in range(RECORD_COUNT)]
             predicted_points = []
             transform = build_axis_transform(perm, signs)
-            for sample in [transform_pose_sample(sample, transform) for sample in existing[:RECORD_COUNT]]:
+            for sample in [transform_pose_sample(sample, transform) for sample in existing]:
                 p = np.asarray(sample["position"], dtype=float)
                 r = np.asarray(sample["rotation"], dtype=float)
                 predicted_points.append(scale * (r @ d + p) + o)
-            print("Recording complete.")
             print(f"d = {d[0]:.9f}, {d[1]:.9f}, {d[2]:.9f}")
             print(f"scale = {scale:.9f}")
             print(f"offset = {o[0]:.9f}, {o[1]:.9f}, {o[2]:.9f}")
@@ -403,6 +309,46 @@ def main() -> int:
             print_point_error_report(target_points, predicted_points)
             plot_point_comparison(target_points, predicted_points, title=f"Interpolated targets vs fitted device points {format_axis_transform(perm, signs)}")
             return 0
+
+        start_step = len(existing) + 1
+        for step in range(start_step, RECORD_COUNT + 1):
+            input(f"Prepare for Step {step}. Press Enter when ready to start 5s countdown... ")
+            print("Waiting 5 seconds...")
+            time.sleep(5.0)
+            if lib.haptics_get_pose(transform, position) == 0:
+                err = lib.haptics_last_error()
+                raise RuntimeError(err.decode("utf-8") if err else "failed to query pose")
+
+            existing.append({
+                "position": [float(position[0]), float(position[1]), float(position[2])],
+                "rotation": [
+                    [float(transform[0]), float(transform[4]), float(transform[8])],
+                    [float(transform[1]), float(transform[5]), float(transform[9])],
+                    [float(transform[2]), float(transform[6]), float(transform[10])],
+                ],
+            })
+            save_recording(out_path, existing)
+            print(f"Recorded step {step}/{RECORD_COUNT} and saved to {out_path}")
+
+        d, scale, o, initial_residual, residual, singular_values, perm, signs = solve_local_vector_with_axis_permutation(existing[:RECORD_COUNT])
+        target_points = [target_point_for_query(i) for i in range(RECORD_COUNT)]
+        predicted_points = []
+        transform = build_axis_transform(perm, signs)
+        for sample in [transform_pose_sample(sample, transform) for sample in existing[:RECORD_COUNT]]:
+            p = np.asarray(sample["position"], dtype=float)
+            r = np.asarray(sample["rotation"], dtype=float)
+            predicted_points.append(scale * (r @ d + p) + o)
+        print("Recording complete.")
+        print(f"d = {d[0]:.9f}, {d[1]:.9f}, {d[2]:.9f}")
+        print(f"scale = {scale:.9f}")
+        print(f"offset = {o[0]:.9f}, {o[1]:.9f}, {o[2]:.9f}")
+        print(f"axis_transform = {format_axis_transform(perm, signs)}")
+        print(f"initial_residual = {initial_residual:.9f}")
+        print(f"residual_norm = {residual:.9f}")
+        print("singular_values = " + ", ".join(f"{value:.9f}" for value in singular_values))
+        print_point_error_report(target_points, predicted_points)
+        plot_point_comparison(target_points, predicted_points, title=f"Interpolated targets vs fitted device points {format_axis_transform(perm, signs)}")
+        return 0
     except KeyboardInterrupt:
         return 0
     finally:
