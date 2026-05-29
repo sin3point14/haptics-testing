@@ -260,7 +260,7 @@ def load_library(base_dir: str) -> ctypes.CDLL:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", default="openhaptics", choices=["openhaptics", "geomagic", "haption"])
-    parser.add_argument("--device", default="", help="Device name for OpenHaptics or connection string for Haption")
+    parser.add_argument("--device", default="127.0.0.1#5000", help="Device name for OpenHaptics or connection string for Haption")
     parser.add_argument("--interval", type=float, default=0.02, help="Seconds between queries")
     parser.add_argument("--samples", type=int, default=0, help="Number of samples to print before exiting; 0 means run forever")
     parser.add_argument("--output", default="recording.json", help="Output path for recording (JSON)")
